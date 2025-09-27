@@ -4,14 +4,14 @@
 #![feature(maybe_uninit_write_slice)]
 #![feature(file_buffered)]
 
-use rustio::{WritableStream, WriteDrain};
+use rustio::{StackBuffer, WritableStream};
 use std::fs::File;
 use std::io::{self, Cursor, Read};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn memory_demo() -> io::Result<()> {
-    let mut stream = WritableStream::with_capacity(4096, WriteDrain::new(Vec::new()));
+    let mut stream = WritableStream::with_capacity(4096, Vec::new());
     {
         let w = stream.writer();
         w.write_all(b"hello ")?;
@@ -28,7 +28,7 @@ fn memory_demo() -> io::Result<()> {
     }
     println!(
         "after first flush -> {}",
-        std::str::from_utf8(stream.sink().out.as_slice()).unwrap()
+        std::str::from_utf8(stream.sink().as_slice()).unwrap()
     );
 
     {
@@ -47,31 +47,31 @@ fn memory_demo() -> io::Result<()> {
 
     println!(
         "after second flush -> {}",
-        std::str::from_utf8(stream.sink().out.as_slice()).unwrap()
+        std::str::from_utf8(stream.sink().as_slice()).unwrap()
     );
     Ok(())
 }
 
 fn stack_reuse_demo() -> io::Result<()> {
-    let mut buffer = [0u8; 64];
+    let mut storage = StackBuffer::<64>::new();
 
     {
-        let mut stream = WritableStream::with_stack(&mut buffer, WriteDrain::new(Vec::new()));
+        let mut stream = WritableStream::with_buffer(&mut storage, Vec::new());
         stream.writer().write_all(b"stack first run")?;
         stream.writer().flush()?;
         println!(
             "first run -> {}",
-            std::str::from_utf8(stream.sink().out.as_slice()).unwrap()
+            std::str::from_utf8(stream.sink().as_slice()).unwrap()
         );
     }
 
     {
-        let mut stream = WritableStream::with_stack(&mut buffer, WriteDrain::new(Vec::new()));
+        let mut stream = WritableStream::with_buffer(&mut storage, Vec::new());
         stream.writer().write_all(b"stack reuse")?;
         stream.writer().flush()?;
         println!(
             "reuse -> {}",
-            std::str::from_utf8(stream.sink().out.as_slice()).unwrap()
+            std::str::from_utf8(stream.sink().as_slice()).unwrap()
         );
     }
     Ok(())
@@ -81,13 +81,13 @@ fn stdout_demo() -> io::Result<()> {
     let mut buffer = [0u8; 256];
 
     {
-        let mut stdout = WritableStream::with_stack(&mut buffer, WriteDrain::new(io::stdout()));
+        let mut stdout = WritableStream::with_slice(&mut buffer, io::stdout());
         stdout.writer().write_all(b"stack-backed logger\n")?;
         stdout.writer().flush()?;
     }
 
     {
-        let mut stdout = WritableStream::with_capacity(8, WriteDrain::new(io::stdout()));
+        let mut stdout = WritableStream::with_capacity(8, io::stdout());
         stdout.writer().write_all(b"allocating logger\n")?;
         stdout.writer().flush()?;
     }
@@ -106,7 +106,7 @@ fn file_demo() -> io::Result<()> {
 
     {
         let file = File::create_new(path)?;
-        let mut file_logger = WritableStream::with_capacity(8, WriteDrain::new(file));
+        let mut file_logger = WritableStream::with_capacity(8, file);
         let w = file_logger.writer();
         w.write_all(b"file logger demo\n")?;
         w.write_all(b"log entry 1\n")?;
