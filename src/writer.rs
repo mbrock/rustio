@@ -352,10 +352,7 @@ mod tests {
         let mut stream = WritableStream::with_stack(&mut buf, WriteDrain::new(Vec::new()));
         stream.writer().write_all(b"stack")?;
         stream.writer().flush()?;
-        assert_eq!(
-            std::str::from_utf8(stream.sink().out.as_slice()).unwrap(),
-            "stack"
-        );
+        assert_eq!(stream.sink().out.as_ref(), b"stack");
         Ok(())
     }
 
@@ -365,8 +362,7 @@ mod tests {
         let writer = stream.writer();
         writer.write_all(b"hi")?;
         writer.flush()?;
-        let out = stream.sink().out.as_ref();
-        assert_eq!(out, b"hi");
+        assert_eq!(stream.sink().out.as_ref(), b"hi");
         Ok(())
     }
 
@@ -376,15 +372,9 @@ mod tests {
         let writer = stream.writer();
         writer.write_all(b"hi")?;
         writer.with_filled(|filled| assert_eq!(filled, b"hi"));
-        assert_eq!(
-            std::str::from_utf8(stream.sink().out.as_slice()).unwrap(),
-            ""
-        );
+        assert_eq!(stream.sink().out.as_ref(), b"");
         stream.writer().flush()?;
-        assert_eq!(
-            std::str::from_utf8(stream.sink().out.as_slice()).unwrap(),
-            "hi"
-        );
+        assert_eq!(stream.sink().out.as_ref(), b"hi");
         Ok(())
     }
 
@@ -395,10 +385,7 @@ mod tests {
         stream.writer().splat_all(b"ab", 3)?;
         stream.writer().flush()?;
 
-        assert_eq!(
-            std::str::from_utf8(stream.sink().out.as_slice()).unwrap(),
-            "ababab"
-        );
+        assert_eq!(stream.sink().out.as_ref(), b"ababab");
 
         Ok(())
     }
@@ -410,10 +397,7 @@ mod tests {
         let segments: [&[u8]; 2] = [b"ab".as_ref(), b"cd".as_ref()];
         writer.write_vec_splat(&segments, 2)?;
         writer.flush()?;
-        assert_eq!(
-            std::str::from_utf8(stream.sink().out.as_slice()).unwrap(),
-            "abcdcd"
-        );
+        assert_eq!(stream.sink().out.as_ref(), b"abcdcd");
         Ok(())
     }
 }
