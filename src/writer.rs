@@ -36,10 +36,9 @@ pub trait Sink: Any {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
-pub struct WritableStream<S: Sink> {
-    //    buffer: StreamBuffer<'buf>,
+pub struct WritableStream<'buf, S: Sink> {
     writer: Box<Writer>,
-    _marker: PhantomData<S>,
+    _phantom: PhantomData<(&'buf mut [MaybeUninit<u8>], S)>,
 }
 
 /// Implements the sink trait for any `Write` type.
@@ -350,11 +349,11 @@ impl<const N: usize> StackBuffer<N> {
         Writer::from_uninit_slice(self.as_uninit_mut(), Box::new(sink))
     }
 
-    pub fn writable_stream<S>(&mut self, sink: S) -> WritableStream<S>
+    pub fn writable_stream<S>(&mut self, sink: S) -> WritableStream<'_, S>
     where
         S: Sink,
     {
-        WritableStream::with_buffer(&mut self.data, sink)
+        WritableStream::with_buffer(self, sink)
     }
 }
 
@@ -408,31 +407,57 @@ impl<H: Update + FixedOutputReset> Hashing<H> {
 
 impl<H: Update + FixedOutputReset + 'static> Sink for Hashing<H> {
     fn drain(&mut self, w: &mut Writer, data: &[&[u8]], splat: usize) -> io::Result<usize> {
-        let mut i = w.end;
-        {
-            let staged = unsafe { assume_init_slice(&w.buf_slice()[..w.end]) };
-            i -= self.with_sink(|sink, _| sink.write(staged))?;
-
-            self.hasher.update(&staged[0..i]);
-            w.end = i;
+        let staged = unsafe { assume_init_slice(&w.buf_slice()[..w.end]) };
+        let wrote_from_buffer = self.with_sink(|sink, _| sink.write(staged))?;
+        if wrote_from_buffer > 0 {
+            self.hasher.update(&staged[..wrote_from_buffer]);
         }
 
-        if w.end == 0 {
-            let m = self.with_sink(|sink, _| sink.write_vec_splat(data, splat))?;
-
-            // lazy code
-            let mut buffel = Vec::<u8>::with_capacity(m);
-            let mut tmp = WritableStream::with_uninit_buffer(
-                buffel.spare_capacity_mut(),
-                Box::new(Vec::new()),
-            );
-            tmp.writer().write_vec_splat(data, splat)?;
-            tmp.writer().flush()?;
-            self.hasher.update(tmp.sink());
-            Ok(m)
-        } else {
-            Ok(0)
+        let mut consumed_from_data = w.consume(wrote_from_buffer);
+        if w.end != 0 {
+            return Ok(consumed_from_data);
         }
+
+        // there should be some way to not repeat this boring code all the time lol
+
+        let wrote_from_data = self.with_sink(|sink, _| sink.write_vec_splat(data, splat))?;
+        if wrote_from_data > 0 {
+            let mut remaining = wrote_from_data;
+            let mut hashed = Vec::with_capacity(remaining);
+
+            if data.len() > 1 {
+                for slice in &data[..data.len() - 1] {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let take = slice.len().min(remaining);
+                    hashed.extend_from_slice(&slice[..take]);
+                    remaining -= take;
+                }
+            }
+
+            if remaining > 0 && splat > 0 {
+                let pattern = data[data.len() - 1];
+                if !pattern.is_empty() {
+                    let mut copies = splat;
+                    while remaining > 0 && copies > 0 {
+                        let take = pattern.len().min(remaining);
+                        hashed.extend_from_slice(&pattern[..take]);
+                        remaining -= take;
+                        if take < pattern.len() {
+                            break;
+                        }
+                        copies -= 1;
+                    }
+                }
+            }
+
+            debug_assert!(remaining == 0);
+            self.hasher.update(&hashed);
+        }
+
+        consumed_from_data += wrote_from_data;
+        Ok(consumed_from_data)
     }
 
     fn flush(&mut self, w: &mut Writer) -> io::Result<()> {
@@ -452,12 +477,12 @@ impl<H: Update + FixedOutputReset + 'static> Sink for Hashing<H> {
     }
 }
 
-impl<S: Sink> WritableStream<S> {
+impl<'buf, S: Sink> WritableStream<'buf, S> {
     fn new(mut writer: Writer) -> Self {
         writer.end = 0;
         Self {
             writer: Box::new(writer),
-            _marker: PhantomData,
+            _phantom: PhantomData,
         }
     }
 
@@ -469,19 +494,19 @@ impl<S: Sink> WritableStream<S> {
     //     Self::new(buffer, writer)
     // }
 
-    pub fn with_uninit_buffer(buf: &mut [MaybeUninit<u8>], sink: S) -> Self {
+    pub fn with_uninit_buffer(buf: &'buf mut [MaybeUninit<u8>], sink: S) -> Self {
         let writer = Writer::from_uninit_slice(buf, Box::new(sink));
         Self::new(writer)
     }
 
-    pub fn with_slice(buf: &mut [u8], sink: S) -> Self {
+    pub fn with_slice(buf: &'buf mut [u8], sink: S) -> Self {
         let len = buf.len();
         let ptr = buf.as_mut_ptr().cast::<MaybeUninit<u8>>();
         let uninit = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
         Self::with_uninit_buffer(uninit, sink)
     }
 
-    pub fn with_buffer<B>(buffer: &mut B, sink: S) -> Self
+    pub fn with_buffer<B>(buffer: &'buf mut B, sink: S) -> Self
     where
         B: AsMut<[MaybeUninit<u8>]>,
     {
