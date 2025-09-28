@@ -674,13 +674,13 @@ mod tests {
     fn hashing_sink_works() -> io::Result<()> {
         use sha2::{Digest, Sha256};
 
-        let mut fofo: Vec<u8> = Vec::with_capacity(8);
-        let sink = Writer::from_vector(&mut fofo, Box::new(Vec::new()));
+        let mut sink_buffer: Vec<u8> = Vec::with_capacity(8);
+        let sink = Writer::from_vector(&mut sink_buffer, Box::new(Vec::new()));
 
         let hashing = Hashing::new(Sha256::new(), sink);
 
-        let mut buffer = StackBuffer::<4>::new(); // why doesn't it work with 8 lol
-        let mut stream = buffer.writable_stream(hashing);
+        let mut hash_buffer = StackBuffer::<16>::new();
+        let mut stream = hash_buffer.writable_stream(hashing);
 
         stream.writer().write_all(b"foobar")?;
         stream.writer().flush()?;
