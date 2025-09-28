@@ -5,4 +5,4 @@
 
 pub mod writer;
 
-pub use writer::{Drain, Sink, StackBuffer, WritableStream};
+pub use writer::{Hashing, Sink, StackBuffer, WritableStream, Writer};
