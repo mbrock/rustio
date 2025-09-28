@@ -1,5 +1,4 @@
 use sha2::digest::{FixedOutputReset, Output, Update};
-use std::any::Any;
 use std::fmt;
 use std::io::{self, BorrowedBuf, IoSlice, Write};
 use std::marker::PhantomData;
@@ -11,20 +10,21 @@ use std::ptr::NonNull;
 ///
 /// Being concrete, it can have many useful methods without multiplying
 /// generated code size by the number of sink types.
-pub struct Writer {
+pub struct Writer<'buf> {
     ptr: NonNull<MaybeUninit<u8>>,
     len: usize,
     pub(crate) end: usize,
-    backend: Option<Box<dyn Sink>>,
+    backend: Option<Box<dyn Sink + 'buf>>,
+    _buffer: PhantomData<&'buf mut [MaybeUninit<u8>]>,
 }
 
 /// Zig-inspired writer sink trait, like `std.Io.Writer.VTable`.
-pub trait Sink: Any {
+pub trait Sink {
     /// Push bytes to the logical sink according to the write contract.
-    fn drain(&mut self, w: &mut Writer, data: &[&[u8]], splat: usize) -> io::Result<usize>;
+    fn drain(&mut self, w: &mut Writer<'_>, data: &[&[u8]], splat: usize) -> io::Result<usize>;
 
     /// Default flush: repeatedly drain staged bytes until empty.
-    fn flush(&mut self, w: &mut Writer) -> io::Result<()> {
+    fn flush(&mut self, w: &mut Writer<'_>) -> io::Result<()> {
         while w.end != 0 {
             let n = self.drain(w, &[&[]], 0)?;
             debug_assert_eq!(n, 0);
@@ -32,22 +32,21 @@ pub trait Sink: Any {
         Ok(())
     }
 
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
-pub struct WritableStream<'buf, S: Sink> {
-    writer: Box<Writer>,
-    _phantom: PhantomData<(&'buf mut [MaybeUninit<u8>], S)>,
+pub struct WritableStream<'buf, S: Sink + 'buf> {
+    writer: Box<Writer<'buf>>,
+    sink_ptr: NonNull<S>,
+    _sink: PhantomData<&'buf mut S>,
 }
 
 /// Implements the sink trait for any `Write` type.
 /// Drains the buffer content and the data as a vectored write.
 impl<T> Sink for T
 where
-    T: Write + Any + 'static,
+    T: Write + 'static,
 {
-    fn drain(&mut self, w: &mut Writer, data: &[&[u8]], splat: usize) -> io::Result<usize> {
+    fn drain(&mut self, w: &mut Writer<'_>, data: &[&[u8]], splat: usize) -> io::Result<usize> {
         debug_assert!(!data.is_empty());
 
         let staged = unsafe { assume_init_slice(&w.buf_slice()[..w.end]) };
@@ -81,7 +80,7 @@ where
         Ok(from_data)
     }
 
-    fn flush(&mut self, w: &mut Writer) -> io::Result<()> {
+    fn flush(&mut self, w: &mut Writer<'_>) -> io::Result<()> {
         while w.end != 0 {
             let n = self.drain(w, &[&[]], 0)?;
             debug_assert_eq!(n, 0)
@@ -89,16 +88,9 @@ where
         Write::flush(self)
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
 }
 
-impl fmt::Debug for Writer {
+impl<'buf> fmt::Debug for Writer<'buf> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Writer")
             .field("capacity", &self.capacity())
@@ -107,8 +99,8 @@ impl fmt::Debug for Writer {
     }
 }
 
-impl Writer {
-    pub fn from_uninit_slice(buf: &mut [MaybeUninit<u8>], backend: Box<dyn Sink>) -> Self {
+impl<'buf> Writer<'buf> {
+    pub fn from_uninit_slice(buf: &'buf mut [MaybeUninit<u8>], backend: Box<dyn Sink + 'buf>) -> Self {
         let len = buf.len();
         let ptr = NonNull::new(buf.as_mut_ptr()).expect("slice pointer should never be null");
         Self {
@@ -116,18 +108,15 @@ impl Writer {
             len,
             end: 0,
             backend: Some(backend),
+            _buffer: PhantomData,
         }
     }
 
-    pub fn from_slice(buf: &mut [u8], backend: Box<dyn Sink>) -> Self {
+    pub fn from_slice(buf: &'buf mut [u8], backend: Box<dyn Sink + 'buf>) -> Self {
         let len = buf.len();
         let ptr = buf.as_mut_ptr().cast::<MaybeUninit<u8>>();
         let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
         Self::from_uninit_slice(slice, backend)
-    }
-
-    pub fn from_vector(buf: &mut Vec<u8>, backend: Box<dyn Sink>) -> Self {
-        Self::from_uninit_slice(buf.spare_capacity_mut(), backend)
     }
 
     #[inline]
@@ -274,17 +263,6 @@ impl Writer {
         out
     }
 
-    pub(crate) fn backend_as<T: Sink + 'static>(&self) -> Option<&T> {
-        self.backend
-            .as_ref()
-            .and_then(|backend| backend.as_any().downcast_ref::<T>())
-    }
-
-    pub fn backend_as_mut<T: Sink + 'static>(&mut self) -> Option<&mut T> {
-        self.backend
-            .as_mut()
-            .and_then(|x| x.as_any_mut().downcast_mut::<T>())
-    }
 }
 
 pub(crate) unsafe fn assume_init_slice(slice: &[MaybeUninit<u8>]) -> &[u8] {
@@ -342,16 +320,9 @@ impl<const N: usize> StackBuffer<N> {
         unsafe { assume_init_slice(&self.data[..len]) }
     }
 
-    pub fn writer<S>(&mut self, sink: S) -> Writer
+    pub fn writable_stream<'buf, S>(&'buf mut self, sink: S) -> WritableStream<'buf, S>
     where
-        S: Sink,
-    {
-        Writer::from_uninit_slice(self.as_uninit_mut(), Box::new(sink))
-    }
-
-    pub fn writable_stream<S>(&mut self, sink: S) -> WritableStream<'_, S>
-    where
-        S: Sink,
+        S: Sink + 'buf,
     {
         WritableStream::with_buffer(self, sink)
     }
@@ -371,13 +342,13 @@ impl<const N: usize> AsMut<[MaybeUninit<u8>]> for StackBuffer<N> {
 
 /// A sink type that forwards to an underlying writer
 /// while updating a hash digest with all forwarded bytes.
-pub struct Hashing<H: Update + FixedOutputReset> {
-    sink: Option<Writer>,
+pub struct Hashing<'buf, H: Update + FixedOutputReset> {
+    sink: Option<Writer<'buf>>,
     hasher: H,
 }
 
-impl<H: Update + FixedOutputReset> Hashing<H> {
-    pub fn new(digest: H, sink: Writer) -> Self {
+impl<'buf, H: Update + FixedOutputReset> Hashing<'buf, H> {
+    pub fn new(digest: H, sink: Writer<'buf>) -> Self {
         Self {
             sink: Some(sink),
             hasher: digest,
@@ -389,24 +360,24 @@ impl<H: Update + FixedOutputReset> Hashing<H> {
         self.hasher.finalize_fixed_reset()
     }
 
-    pub fn with_sink<R>(&mut self, f: impl FnOnce(&mut Writer, &mut Self) -> R) -> R {
+    pub fn with_sink<R>(&mut self, f: impl FnOnce(&mut Writer<'buf>, &mut Self) -> R) -> R {
         let mut sink = self.sink.take().unwrap();
         let r = f(&mut sink, self);
         self.sink = Some(sink);
         r
     }
 
-    pub fn borrow_sink(&self) -> Option<&Writer> {
+    pub fn borrow_sink(&self) -> Option<&Writer<'buf>> {
         self.sink.as_ref()
     }
 
-    pub fn take_sink(&mut self) -> Option<Writer> {
+    pub fn take_sink(&mut self) -> Option<Writer<'buf>> {
         self.sink.take()
     }
 }
 
-impl<H: Update + FixedOutputReset + 'static> Sink for Hashing<H> {
-    fn drain(&mut self, w: &mut Writer, data: &[&[u8]], splat: usize) -> io::Result<usize> {
+impl<'buf, H: Update + FixedOutputReset + 'static> Sink for Hashing<'buf, H> {
+    fn drain(&mut self, w: &mut Writer<'_>, data: &[&[u8]], splat: usize) -> io::Result<usize> {
         let staged = unsafe { assume_init_slice(&w.buf_slice()[..w.end]) };
         let wrote_from_buffer = self.with_sink(|sink, _| sink.write(staged))?;
         if wrote_from_buffer > 0 {
@@ -460,7 +431,7 @@ impl<H: Update + FixedOutputReset + 'static> Sink for Hashing<H> {
         Ok(consumed_from_data)
     }
 
-    fn flush(&mut self, w: &mut Writer) -> io::Result<()> {
+    fn flush(&mut self, w: &mut Writer<'_>) -> io::Result<()> {
         while w.end > 0 {
             let n = self.drain(w, &[&[]], 0)?;
             debug_assert_eq!(n, 0)
@@ -468,21 +439,15 @@ impl<H: Update + FixedOutputReset + 'static> Sink for Hashing<H> {
         self.with_sink(|sink, _| sink.flush())
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
 }
 
-impl<'buf, S: Sink> WritableStream<'buf, S> {
-    fn new(mut writer: Writer) -> Self {
+impl<'buf, S: Sink + 'buf> WritableStream<'buf, S> {
+    fn new(mut writer: Writer<'buf>, sink_ptr: NonNull<S>) -> Self {
         writer.end = 0;
         Self {
             writer: Box::new(writer),
-            _phantom: PhantomData,
+            sink_ptr,
+            _sink: PhantomData,
         }
     }
 
@@ -495,8 +460,10 @@ impl<'buf, S: Sink> WritableStream<'buf, S> {
     // }
 
     pub fn with_uninit_buffer(buf: &'buf mut [MaybeUninit<u8>], sink: S) -> Self {
-        let writer = Writer::from_uninit_slice(buf, Box::new(sink));
-        Self::new(writer)
+        let sink_box = Box::new(sink);
+        let sink_ptr = NonNull::new(Box::into_raw(sink_box)).expect("boxed sink should not be null");
+        let writer = Writer::from_uninit_slice(buf, unsafe { Box::from_raw(sink_ptr.as_ptr()) });
+        Self::new(writer, sink_ptr)
     }
 
     pub fn with_slice(buf: &'buf mut [u8], sink: S) -> Self {
@@ -513,18 +480,16 @@ impl<'buf, S: Sink> WritableStream<'buf, S> {
         Self::with_uninit_buffer(buffer.as_mut(), sink)
     }
 
-    pub fn writer(&mut self) -> &mut Writer {
+    pub fn writer(&mut self) -> &mut Writer<'buf> {
         &mut self.writer
     }
 
     pub fn sink(&self) -> &S {
-        self.writer
-            .backend_as::<S>()
-            .expect("backend should be our sink type")
+        unsafe { self.sink_ptr.as_ref() }
     }
 
     pub fn sink_mut(&mut self) -> &mut S {
-        self.writer.backend_as_mut().unwrap()
+        unsafe { self.sink_ptr.as_mut() }
     }
 
     pub fn capacity(&self) -> usize {
@@ -535,12 +500,38 @@ impl<'buf, S: Sink> WritableStream<'buf, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::io::Write;
+    use std::rc::Rc;
+
+    struct RecordingSink {
+        target: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> (Self, Rc<RefCell<Vec<u8>>>) {
+            let target = Rc::new(RefCell::new(Vec::new()));
+            (Self {
+                target: Rc::clone(&target),
+            }, target)
+        }
+    }
+
+    impl Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.target.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn stack_buffer_to_allocating_drain() -> io::Result<()> {
         let mut storage = StackBuffer::<16>::new();
-        let mut stream = storage.writable_stream(Vec::new());
+        let mut stream = storage.writable_stream(Vec::<u8>::new());
 
         stream.writer().write_all(b"stack")?;
         stream.writer().flush()?;
@@ -553,7 +544,7 @@ mod tests {
         let mut storage = StackBuffer::<16>::new();
 
         {
-            let mut stream = storage.writable_stream(Vec::new());
+            let mut stream = storage.writable_stream(Vec::<u8>::new());
             stream.writer().write_all(b"first")?;
             stream.writer().flush()?;
             let collected = stream.sink().as_slice().to_vec();
@@ -564,7 +555,7 @@ mod tests {
         }
 
         {
-            let mut stream = storage.writable_stream(Vec::new());
+            let mut stream = storage.writable_stream(Vec::<u8>::new());
             stream.writer().write_all(b"second")?;
             stream.writer().flush()?;
             let collected = stream.sink().as_slice().to_vec();
@@ -580,7 +571,7 @@ mod tests {
     #[test]
     fn owned_buffer_to_allocating_drain() -> io::Result<()> {
         let mut buffer = StackBuffer::<8>::new();
-        let mut stream = buffer.writable_stream(Vec::new());
+        let mut stream = buffer.writable_stream(Vec::<u8>::new());
         let writer = stream.writer();
         writer.write_all(b"hi")?;
         writer.flush()?;
@@ -591,7 +582,7 @@ mod tests {
     #[test]
     fn fast_path_write_stays_in_buffer() -> io::Result<()> {
         let mut buffer = StackBuffer::<16>::new();
-        let mut stream = buffer.writable_stream(Vec::new());
+        let mut stream = buffer.writable_stream(Vec::<u8>::new());
         let writer = stream.writer();
         writer.write_all(b"hi")?;
         writer.with_filled(|filled| assert_eq!(filled, b"hi"));
@@ -604,7 +595,7 @@ mod tests {
     #[test]
     fn splat_all_repeats_pattern_when_overflowing() -> io::Result<()> {
         let mut buffer = StackBuffer::<4>::new();
-        let mut stream = buffer.writable_stream(Vec::new());
+        let mut stream = buffer.writable_stream(Vec::<u8>::new());
 
         stream.writer().splat_all(b"ab", 3)?;
         stream.writer().flush()?;
@@ -617,7 +608,7 @@ mod tests {
     #[test]
     fn write_vec_splat_handles_multiple_segments() -> io::Result<()> {
         let mut buffer = StackBuffer::<16>::new();
-        let mut stream = buffer.writable_stream(Vec::new());
+        let mut stream = buffer.writable_stream(Vec::<u8>::new());
 
         let writer = stream.writer();
         let segments: [&[u8]; 2] = [b"ab".as_ref(), b"cd".as_ref()];
@@ -674,8 +665,12 @@ mod tests {
     fn hashing_sink_works() -> io::Result<()> {
         use sha2::{Digest, Sha256};
 
-        let mut sink_buffer: Vec<u8> = Vec::with_capacity(8);
-        let sink = Writer::from_vector(&mut sink_buffer, Box::new(Vec::new()));
+        let mut sink_buffer = StackBuffer::<128>::new();
+        let (recording_sink, recorded) = RecordingSink::new();
+        let sink = Writer::from_uninit_slice(
+            sink_buffer.as_uninit_mut(),
+            Box::new(recording_sink),
+        );
 
         let hashing = Hashing::new(Sha256::new(), sink);
 
@@ -688,14 +683,8 @@ mod tests {
         let digest = stream.sink_mut().digest();
 
         assert_eq!(digest, Sha256::digest(b"foobar"));
-        let out = stream
-            .sink()
-            .borrow_sink()
-            .unwrap()
-            .backend_as::<Vec<u8>>()
-            .unwrap()
-            .as_slice();
-        assert_eq!(out, b"foobar");
+        let out = recorded.borrow().clone();
+        assert_eq!(out.as_slice(), b"foobar");
 
         Ok(())
     }

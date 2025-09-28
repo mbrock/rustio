@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn memory_demo() -> io::Result<()> {
     let mut buffer = StackBuffer::<4096>::new();
-    let mut stream = buffer.writable_stream(Vec::new());
+    let mut stream = buffer.writable_stream(Vec::<u8>::new());
 
     {
         let w = stream.writer();
@@ -58,7 +58,7 @@ fn stack_reuse_demo() -> io::Result<()> {
     let mut storage = StackBuffer::<64>::new();
 
     {
-        let mut stream = WritableStream::with_buffer(&mut storage, Vec::new());
+        let mut stream = WritableStream::with_buffer(&mut storage, Vec::<u8>::new());
         stream.writer().write_all(b"stack first run")?;
         stream.writer().flush()?;
         println!(
@@ -68,7 +68,7 @@ fn stack_reuse_demo() -> io::Result<()> {
     }
 
     {
-        let mut stream = WritableStream::with_buffer(&mut storage, Vec::new());
+        let mut stream = WritableStream::with_buffer(&mut storage, Vec::<u8>::new());
         stream.writer().write_all(b"stack reuse")?;
         stream.writer().flush()?;
         println!(
