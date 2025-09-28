@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn memory_demo() -> io::Result<()> {
-    let mut stream = WritableStream::with_capacity(4096, Vec::new());
+    let mut buffer = StackBuffer::<4096>::new();
+    let mut stream = buffer.writable_stream(Vec::new());
+
     {
         let w = stream.writer();
         w.write_all(b"hello ")?;
@@ -87,7 +89,9 @@ fn stdout_demo() -> io::Result<()> {
     }
 
     {
-        let mut stdout = WritableStream::with_capacity(8, io::stdout());
+        let mut buffer = StackBuffer::<8>::new();
+        let mut stdout = buffer.writable_stream(io::stdout());
+
         stdout.writer().write_all(b"allocating logger\n")?;
         stdout.writer().flush()?;
     }
@@ -106,7 +110,9 @@ fn file_demo() -> io::Result<()> {
 
     {
         let file = File::create_new(path)?;
-        let mut file_logger = WritableStream::with_capacity(8, file);
+        let mut buffer = StackBuffer::<8>::new();
+        let mut file_logger = buffer.writable_stream(file);
+
         let w = file_logger.writer();
         w.write_all(b"file logger demo\n")?;
         w.write_all(b"log entry 1\n")?;
