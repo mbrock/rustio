@@ -6,7 +6,19 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
-/// Primary sink trait mirroring the Zig `drain` contract.
+/// Zig-inspired buffered writer as a concrete type with a vtable
+/// that it only touches when the buffer is full.
+///
+/// Being concrete, it can have many useful methods without multiplying
+/// generated code size by the number of sink types.
+pub struct Writer {
+    ptr: NonNull<MaybeUninit<u8>>,
+    len: usize,
+    pub(crate) end: usize,
+    backend: Option<Box<dyn Sink>>,
+}
+
+/// Zig-inspired writer sink trait, like `std.Io.Writer.VTable`.
 pub trait Sink: Any {
     /// Push bytes to the logical sink according to the write contract.
     fn drain(&mut self, w: &mut Writer, data: &[&[u8]], splat: usize) -> io::Result<usize>;
@@ -24,6 +36,15 @@ pub trait Sink: Any {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
+/// Semi-convenient thing for constructing a writer and a buffer at the same time.
+pub struct WritableStream<'buf, S: Sink> {
+    buffer: StreamBuffer<'buf>,
+    writer: Box<Writer>,
+    _marker: PhantomData<S>,
+}
+
+/// Implements the sink trait for any `Write` type.
+/// Drains the buffer content and the data as a vectored write.
 impl<T> Sink for T
 where
     T: Write + Any + 'static,
@@ -77,13 +98,6 @@ where
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
-}
-
-pub struct Writer {
-    ptr: NonNull<MaybeUninit<u8>>,
-    len: usize,
-    pub(crate) end: usize,
-    backend: Option<Box<dyn Sink>>,
 }
 
 impl fmt::Debug for Writer {
@@ -156,6 +170,8 @@ impl Writer {
         res
     }
 
+    /// Copies data into the buffer if and only if it all fits in the capacity.
+    /// Otherwise drains it through the sink.
     pub fn write_vec_splat(&mut self, data: &[&[u8]], splat: usize) -> io::Result<usize> {
         if data.is_empty() {
             return Ok(0);
@@ -303,6 +319,7 @@ impl<'buf> StreamBuffer<'buf> {
     }
 }
 
+/// Helper for doing Zig-style stack allocated uninitialized byte arrays.
 pub struct StackBuffer<const N: usize> {
     data: [MaybeUninit<u8>; N],
 }
@@ -347,6 +364,8 @@ impl<const N: usize> AsMut<[MaybeUninit<u8>]> for StackBuffer<N> {
     }
 }
 
+/// A sink type that forwards to an underlying writer
+/// while updating a hash digest with all forwarded bytes.
 pub struct Hashing<H: Update + FixedOutputReset> {
     sink: Option<Writer>,
     hasher: H,
@@ -360,6 +379,7 @@ impl<H: Update + FixedOutputReset> Hashing<H> {
         }
     }
 
+    /// Reset the hasher and return its result array.
     pub fn digest(&mut self) -> Output<H> {
         self.hasher.finalize_fixed_reset()
     }
@@ -390,6 +410,8 @@ impl<H: Update + FixedOutputReset + 'static> Sink for Hashing<H> {
         if n == staged.len() {
             let m = self.with_sink(|sink, _| sink.write_vec_splat(data, splat))?;
             n += m;
+
+            // lazy code
             let mut tmp = WritableStream::with_capacity(m, Vec::new());
             tmp.writer().write_vec_splat(data, splat)?;
             tmp.writer().with_filled(|xs| {
@@ -415,13 +437,6 @@ impl<H: Update + FixedOutputReset + 'static> Sink for Hashing<H> {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
-}
-
-/// Generic Zig-style adapter that owns a writer configured with a specific sink.
-pub struct WritableStream<'buf, S: Sink> {
-    buffer: StreamBuffer<'buf>,
-    writer: Box<Writer>,
-    _marker: PhantomData<S>,
 }
 
 impl<'buf, S: Sink> WritableStream<'buf, S> {
@@ -485,9 +500,7 @@ impl<'buf, S: Sink> WritableStream<'buf, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-    use std::io::{IoSlice, Write};
-    use std::rc::Rc;
+    use std::io::Write;
 
     #[test]
     fn stack_buffer_to_allocating_drain() -> io::Result<()> {
@@ -576,50 +589,41 @@ mod tests {
 
     #[test]
     fn write_drain_vectored_consumes_partial() -> io::Result<()> {
-        #[derive(Clone)]
         struct ShortWriter {
-            target: Rc<RefCell<Vec<u8>>>,
+            target: Vec<u8>,
             limit: usize,
+        }
+
+        impl ShortWriter {
+            fn with_limit(limit: usize) -> Self {
+                Self {
+                    target: Vec::new(),
+                    limit,
+                }
+            }
+
+            fn as_slice(&self) -> &[u8] {
+                &self.target
+            }
         }
 
         impl Write for ShortWriter {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                 let n = buf.len().min(self.limit);
-                self.target.borrow_mut().extend_from_slice(&buf[..n]);
+                self.target.extend_from_slice(&buf[..n]);
                 Ok(n)
             }
 
             fn flush(&mut self) -> io::Result<()> {
                 Ok(())
             }
-
-            fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-                let mut remaining = self.limit;
-                let mut wrote = 0;
-                for slice in bufs {
-                    if remaining == 0 {
-                        break;
-                    }
-                    let n = slice.len().min(remaining);
-                    if n > 0 {
-                        self.target.borrow_mut().extend_from_slice(&slice[..n]);
-                        remaining -= n;
-                        wrote += n;
-                    }
-                }
-                Ok(wrote)
-            }
         }
 
-        let target = Rc::new(RefCell::new(Vec::new()));
-        let writer_impl = ShortWriter {
-            target: target.clone(),
-            limit: 4,
-        };
+        let writer_impl = ShortWriter::with_limit(4);
         let mut stream = WritableStream::with_capacity(2, writer_impl);
         stream.writer().write_all(b"abcdef")?;
         stream.writer().flush()?;
-        assert_eq!(target.borrow().as_slice(), b"abcdef");
+        assert_eq!(stream.sink().as_slice(), b"abcdef");
         Ok(())
     }
 
