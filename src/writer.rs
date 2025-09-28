@@ -538,16 +538,16 @@ mod tests {
             assert_eq!(storage.filled(len), collected.as_slice());
         }
 
-        // {
-        //     let mut stream = storage.writable_stream(Vec::new());
-        //     stream.writer().write_all(b"second")?;
-        //     stream.writer().flush()?;
-        //     let collected = stream.sink().as_slice().to_vec();
-        //     assert_eq!(collected.as_slice(), b"second");
-        //     let len = collected.len();
-        //     drop(stream);
-        //     assert_eq!(storage.filled(len), collected.as_slice());
-        // }
+        {
+            let mut stream = storage.writable_stream(Vec::new());
+            stream.writer().write_all(b"second")?;
+            stream.writer().flush()?;
+            let collected = stream.sink().as_slice().to_vec();
+            assert_eq!(collected.as_slice(), b"second");
+            let len = collected.len();
+            drop(stream);
+            assert_eq!(storage.filled(len), collected.as_slice());
+        }
 
         Ok(())
     }
